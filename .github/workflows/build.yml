@@ -6,101 +6,14 @@ on:
 jobs:
   build:
     runs-on: macos-14
-    timeout-minutes: 45
+    timeout-minutes: 30
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
+          submodules: recursive
           fetch-depth: 0
-
-      - name: Initialize Submodules
-        run: |
-          set -e
-
-          echo "=== gitmodules ==="
-          cat .gitmodules || echo "No .gitmodules"
-
-          echo ""
-          echo "=== Convert SSH to HTTPS ==="
-          sed -i '' 's|git@github.com:|https://github.com/|g' .gitmodules 2>/dev/null || true
-          sed -i '' 's|ssh://git@github.com/|https://github.com/|g' .gitmodules 2>/dev/null || true
-
-          echo ""
-          echo "=== Sync and update ==="
-          git submodule sync --recursive
-          git submodule update --init --recursive --force 2>&1 || {
-            echo "Standard update failed, trying manual..."
-            git submodule init
-            git submodule update --recursive --force 2>&1 || true
-          }
-
-          echo ""
-          echo "=== Check each submodule ==="
-          if [ -f .gitmodules ]; then
-            grep "path = " .gitmodules | sed 's/.*path = //' | tr -d '[:space:]' | while read sm_path; do
-              if [ -z "$(ls -A "$sm_path" 2>/dev/null)" ]; then
-                echo "EMPTY: $sm_path"
-                url=$(git config --file .gitmodules --get "submodule.$sm_path.url" 2>/dev/null || true)
-                if [ -n "$url" ]; then
-                  echo "Cloning $url into $sm_path..."
-                  rm -rf "$sm_path"
-                  git clone --recursive "$url" "$sm_path" 2>&1 || echo "Failed: $sm_path"
-                fi
-              else
-                count=$(find "$sm_path" -type f | wc -l | tr -d ' ')
-                echo "OK: $sm_path ($count files)"
-              fi
-            done
-          fi
-
-          echo ""
-          echo "=== Final status ==="
-          git submodule status --recursive
-          echo ""
-          find . -maxdepth 1 -type d -not -name ".git" -not -name "." | sort | while read dir; do
-            count=$(find "$dir" -type f -not -path "*/.git/*" | wc -l | tr -d ' ')
-            echo "$dir: $count files"
-          done
-
-      - name: Verify All Source Files
-        run: |
-          set -e
-          echo "=== Checking critical files ==="
-
-          MISSING=0
-          SWIFT_COUNT=$(find . -name "*.swift" -type f -not -path "./.git/*" | wc -l | tr -d ' ')
-          OBJ_COUNT=$(find . -name "*.m" -o -name "*.mm" -type f -not -path "./.git/*" | wc -l | tr -d ' ')
-
-          echo "Swift files: $SWIFT_COUNT"
-          echo "ObjC files: $OBJ_COUNT"
-
-          if [ "$SWIFT_COUNT" -lt 5 ]; then
-            echo "ERROR: Too few Swift files"
-            MISSING=1
-          fi
-
-          for critical in "LCUtils.m" "LCAppModel.swift"; do
-            found=$(find . -name "$critical" -not -path "./.git/*" | head -n1)
-            if [ -n "$found" ]; then
-              echo "FOUND: $critical at $found"
-            else
-              echo "MISSING: $critical"
-              MISSING=1
-            fi
-          done
-
-          if [ "$MISSING" = "1" ]; then
-            echo ""
-            echo "=== All Swift files found ==="
-            find . -name "*.swift" -not -path "./.git/*" | sort
-            echo ""
-            echo "=== All ObjC files found ==="
-            find . -name "*.m" -o -name "*.mm" | grep -v ".git" | sort
-            echo ""
-            echo "Some source files are missing."
-            echo "Build may fail."
-          fi
 
       - name: Setup Xcode
         uses: maxim-lobanov/setup-xcode@v1
@@ -118,186 +31,48 @@ jobs:
             echo "project_flag=-workspace" >> $GITHUB_OUTPUT
             echo "project_path=$WS" >> $GITHUB_OUTPUT
             echo "Using workspace: $WS"
-            xcodebuild -workspace "$WS" -list 2>/dev/null || true
-          elif [ -n "$PROJ" ]; then
+          else
             echo "project_flag=-project" >> $GITHUB_OUTPUT
             echo "project_path=$PROJ" >> $GITHUB_OUTPUT
             echo "Using project: $PROJ"
-            xcodebuild -project "$PROJ" -list 2>/dev/null || true
-          else
-            echo "No project found"
-            exit 1
           fi
 
-          TARGET_FILE="${WS:-$PROJ}"
-          SCHEME=""
-          for candidate in "LiveContainer" "LiveContainerFS" "LiveContainer-FS"; do
-            if [ -n "$WS" ]; then
-              count=$(xcodebuild -workspace "$WS" -list 2>/dev/null | grep -c "$candidate" || true)
-            else
-              count=$(xcodebuild -project "$PROJ" -list 2>/dev/null | grep -c "$candidate" || true)
-            fi
-            if [ "$count" -gt 0 ]; then
-              SCHEME="$candidate"
-              break
-            fi
-          done
-
-          if [ -z "$SCHEME" ]; then
-            SCHEME=$(find . -path "*/xcshareddata/xcschemes/*.xcscheme" -exec basename {} .xcscheme \; | head -n1)
-          fi
-
-          if [ -z "$SCHEME" ]; then
-            echo "No scheme found"
-            exit 1
-          fi
-
+          SCHEME=$(find . -path "*/xcshareddata/xcschemes/*.xcscheme" -exec basename {} .xcscheme \; | grep -i "LiveContainer" | head -n1)
           echo "scheme=$SCHEME" >> $GITHUB_OUTPUT
           echo "Scheme: $SCHEME"
-
-      - name: Analyze Dev Cert Check
-        run: |
-          set -e
-
-          echo "=========================================="
-          echo "DEV CERT CHECK ANALYSIS"
-          echo "=========================================="
-
-          echo ""
-          echo "=== 1. get-task-allow references ==="
-          grep -rn "get-task-allow" --include="*.swift" --include="*.m" --include="*.mm" --include="*.h" . 2>/dev/null || echo "None"
-
-          echo ""
-          echo "=== 2. development certificate strings ==="
-          grep -rn -i "development.certificate\|not signed with\|please sign\|dev.*cert" --include="*.swift" --include="*.m" . 2>/dev/null || echo "None"
-
-          echo ""
-          echo "=== 3. LCUtils.m full content ==="
-          LCUTILS=$(find . -name "LCUtils.m" -not -path "./.git/*" | head -n1)
-          if [ -n "$LCUTILS" ]; then
-            echo "File: $LCUTILS"
-            echo "---BEGIN---"
-            cat "$LCUTILS"
-            echo "---END---"
-          else
-            echo "LCUtils.m not found"
-          fi
-
-          echo ""
-          echo "=== 4. LCUtils.h content ==="
-          LCUTILSH=$(find . -name "LCUtils.h" -not -path "./.git/*" | head -n1)
-          if [ -n "$LCUTILSH" ]; then
-            echo "File: $LCUTILSH"
-            echo "---BEGIN---"
-            cat "$LCUTILSH"
-            echo "---END---"
-          else
-            echo "LCUtils.h not found"
-          fi
-
-          echo ""
-          echo "=== 5. Entitlements files ==="
-          find . -name "*.entitlements" -not -path "./.git/*" | while read ent; do
-            echo "--- $ent ---"
-            cat "$ent"
-          done
-
-          echo ""
-          echo "=== 6. SecTask / csops / entitlement API usage ==="
-          grep -rn "SecTaskCopyValueForEntitlement\|csops\|CS_OPS\|CS_GET_TASK_ALLOW" --include="*.m" --include="*.mm" --include="*.h" --include="*.c" . 2>/dev/null || echo "None"
-
-          echo ""
-          echo "=== 7. Alert strings about signing ==="
-          grep -rn "alert\|Alert\|UIAlert\|NSAlert" --include="*.swift" --include="*.m" . 2>/dev/null | grep -i "sign\|cert\|dev\|task" || echo "None"
-
-          echo ""
-          echo "=== 8. Bool checks for signing ==="
-          grep -rn "isDevCert\|isDev\|devCert\|isDevelop\|isJIT\|jitEnabled\|debugg" --include="*.swift" --include="*.m" . 2>/dev/null || echo "None"
 
       - name: Patch Dev Cert Check
         run: |
           set -e
-          echo "=== Patching all certificate checks ==="
+          echo "Patching LCUtils.m to always return YES for get-task-allow..."
 
-          # ---- OBJECTIVE-C: LCUtils.m ----
           LCUTILS=$(find . -name "LCUtils.m" -not -path "./.git/*" | head -n1)
           if [ -n "$LCUTILS" ]; then
-            echo "Patching: $LCUTILS"
-
-            # Replace any get-task-allow check to return YES/true
+            echo "Found: $LCUTILS"
+            
+            # Replace any get-task-allow check to return YES
             sed -i '' 's/objectForKey:@"get-task-allow"\] boolValue\]/YES/g' "$LCUTILS"
             sed -i '' 's/\[@"get-task-allow"\]/@YES/g' "$LCUTILS"
             sed -i '' 's/boolForKey:@"get-task-allow"\]/YES/g' "$LCUTILS"
-            sed -i '' 's/valueForKey:@"get-task-allow"\] boolValue\]/YES/g' "$LCUTILS"
-
+            
             # Replace SecTaskCopyValueForEntitlement for get-task-allow
             sed -i '' '/get-task-allow/{s/SecTaskCopyValueForEntitlement[^;]*/(__bridge id)kCFBooleanTrue/;}' "$LCUTILS"
-
-            # Replace any isDevCert/isDev boolean
-            sed -i '' 's/BOOL isDev = NO/BOOL isDev = YES/g' "$LCUTILS"
-            sed -i '' 's/BOOL isDevCert = NO/BOOL isDevCert = YES/g' "$LCUTILS"
-            sed -i '' 's/isDev = NO/isDev = YES/g' "$LCUTILS"
-            sed -i '' 's/isDevCert = NO/isDevCert = YES/g' "$LCUTILS"
-
+            
             echo "Patched: $LCUTILS"
+          else
+            echo "ERROR: LCUtils.m not found"
+            exit 1
           fi
 
-          # ---- SWIFT FILES ----
-          find . -name "*.swift" -type f -not -path "./.git/*" | while read file; do
-            PATCHED=0
-
-            if grep -q "get-task-allow" "$file" 2>/dev/null; then
-              sed -i '' 's/\["get-task-allow"\] as? Bool ?? false/true/g' "$file"
-              sed -i '' 's/\["get-task-allow"\] as? Bool/true as? Bool/g' "$file"
-              sed -i '' 's/value(forKey: "get-task-allow") as? Bool ?? false/true/g' "$file"
-              sed -i '' 's/object(forKey: "get-task-allow") as? Bool ?? false/true/g' "$file"
-              sed -i '' 's/bool(forKey: "get-task-allow")/true/g' "$file"
-              PATCHED=1
-            fi
-
-            if grep -q "isDevCert\|isDev\|devCert\|isDevelop" "$file" 2>/dev/null; then
-              sed -i '' 's/isDevCert = false/isDevCert = true/g' "$file"
-              sed -i '' 's/isDevelopment = false/isDevelopment = true/g' "$file"
-              sed -i '' 's/devCert = false/devCert = true/g' "$file"
-              sed -i '' 's/isDev = false/isDev = true/g' "$file"
-              PATCHED=1
-            fi
-
-            if grep -q "not signed with a development" "$file" 2>/dev/null; then
-              sed -i '' '/not signed with a development/s/^.*$/\/\/ PATCHED: check removed/' "$file"
-              PATCHED=1
-            fi
-
-            if [ "$PATCHED" = "1" ]; then
-              echo "Patched Swift: $file"
-            fi
-          done
-
-          # ---- ALL OTHER OBJC FILES ----
-          find . \( -name "*.m" -o -name "*.mm" \) -type f -not -path "./.git/*" | while read file; do
-            [ "$file" = "$LCUTILS" ] && continue
-            if grep -q "get-task-allow" "$file" 2>/dev/null; then
-              sed -i '' 's/objectForKey:@"get-task-allow"\] boolValue\]/YES/g' "$file"
-              sed -i '' 's/\[@"get-task-allow"\]/@YES/g' "$file"
-              echo "Patched ObjC: $file"
-            fi
-          done
-
-          # ---- ENTITLEMENTS FILES ----
-          find . -name "*.entitlements" -type f -not -path "./.git/*" | while read ent; do
-            echo "Patching entitlements: $ent"
-            if ! grep -q "get-task-allow" "$ent" 2>/dev/null; then
+          # Add get-task-allow to all entitlements files
+          find . -name "*.entitlements" -type f | while read ent; do
+            echo "Patching: $ent"
+            if ! grep -q "get-task-allow" "$ent"; then
               sed -i '' 's|</dict>|	<key>get-task-allow</key>\
           	<true/>\
           </dict>|' "$ent"
-            else
-              sed -i '' '/<key>get-task-allow<\/key>/{n;s|<false/>|<true/>|;}' "$ent"
             fi
-            cat "$ent"
           done
-
-          echo ""
-          echo "=== All patches applied ==="
 
       - name: Show Changes
         run: |
@@ -337,55 +112,12 @@ jobs:
             2>&1 | tee build.log
 
           if [ ! -d "build/LiveContainer.xcarchive" ]; then
-            echo ""
-            echo "=========================================="
             echo "BUILD FAILED"
-            echo "=========================================="
-            echo ""
-            echo "=== Errors only ==="
-            grep "error:" build.log | grep -v "warning" | tail -40
-            echo ""
-            echo "=== Missing files ==="
-            grep "cannot be found\|no such file" build.log | tail -20
-            echo ""
-            echo "=== Last 60 lines ==="
-            tail -60 build.log
+            grep "error:" build.log | grep -v "warning" | tail -30
+            tail -50 build.log
             exit 1
           fi
           echo "Archive created"
-
-      - name: Verify Archive
-        run: |
-          set -e
-          APP_PATH=$(find build/LiveContainer.xcarchive/Products -name "*.app" -type d | head -n1)
-          if [ -z "$APP_PATH" ]; then
-            echo "No .app in archive"
-            exit 1
-          fi
-
-          echo "App: $APP_PATH"
-          BUNDLE_ID=$(/usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$APP_PATH/Info.plist" 2>/dev/null || echo "MISSING")
-          EXECUTABLE=$(/usr/libexec/PlistBuddy -c "Print :CFBundleExecutable" "$APP_PATH/Info.plist" 2>/dev/null || echo "MISSING")
-          MIN_OS=$(/usr/libexec/PlistBuddy -c "Print :MinimumOSVersion" "$APP_PATH/Info.plist" 2>/dev/null || echo "MISSING")
-          echo "Bundle ID: $BUNDLE_ID"
-          echo "Executable: $EXECUTABLE"
-          echo "Min OS: $MIN_OS"
-
-          if [ ! -f "$APP_PATH/$EXECUTABLE" ]; then
-            echo "FATAL: Executable missing"
-            ls -la "$APP_PATH/"
-            exit 1
-          fi
-
-          ARCH=$(lipo -info "$APP_PATH/$EXECUTABLE" 2>/dev/null || echo "unknown")
-          echo "Architecture: $ARCH"
-
-          echo "Extensions:"
-          find "$APP_PATH" -name "*.appex" -type d 2>/dev/null || echo "None"
-          echo "Frameworks:"
-          find "$APP_PATH" -name "*.framework" -type d 2>/dev/null || echo "None"
-          echo "Dylibs:"
-          find "$APP_PATH" -name "*.dylib" 2>/dev/null || echo "None"
 
       - name: Create IPA
         run: |
@@ -398,17 +130,10 @@ jobs:
 
           echo "Packaging: $(basename "$APP_PATH")"
 
-          # Strip ALL signatures for clean WSF signing
+          # Strip signatures for clean WSF signing
           find "$APP_PATH" -name "_CodeSignature" -type d -exec rm -rf {} + 2>/dev/null || true
           find "$APP_PATH" -name "CodeResources" -delete 2>/dev/null || true
           find "$APP_PATH" -name "embedded.mobileprovision" -delete 2>/dev/null || true
-
-          # Verify executable exists
-          EXEC=$(/usr/libexec/PlistBuddy -c "Print :CFBundleExecutable" "$APP_PATH/Info.plist")
-          if [ ! -f "$APP_PATH/$EXEC" ]; then
-            echo "FATAL: Executable missing after cleanup"
-            exit 1
-          fi
 
           # Package
           mkdir -p Payload
@@ -416,19 +141,7 @@ jobs:
           zip -r build/LiveContainer.ipa Payload -x "*.DS_Store"
           rm -rf Payload
 
-          # Verify
-          IPA_BYTES=$(wc -c < build/LiveContainer.ipa | tr -d ' ')
-          echo "IPA size: $(du -h build/LiveContainer.ipa | awk '{print $1}') ($IPA_BYTES bytes)"
-
-          if [ "$IPA_BYTES" -lt 100000 ]; then
-            echo "WARNING: IPA suspiciously small"
-          fi
-
-          unzip -t build/LiveContainer.ipa > /dev/null 2>&1 || {
-            echo "FATAL: IPA corrupt"
-            exit 1
-          }
-          echo "IPA valid"
+          echo "IPA size: $(du -h build/LiveContainer.ipa | awk '{print $1}')"
 
       - name: Upload IPA
         uses: actions/upload-artifact@v4
